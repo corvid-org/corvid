@@ -92,6 +92,35 @@ pub(super) fn define_extern_c_wrapper(
             }
         }
 
+        let entry_name_val =
+            emit_string_const(&mut builder, module, runtime, &agent.name, agent.span)?;
+        let entry_arg_tys = agent
+            .params
+            .iter()
+            .map(|param| param.ty.clone())
+            .collect::<Vec<_>>();
+        let trace_payload = emit_trace_payload(
+            &mut builder,
+            module,
+            runtime,
+            &call_args,
+            &entry_arg_tys,
+            agent.span,
+        )?;
+        let trace_run_started_ref =
+            module.declare_func_in_func(runtime.trace_run_started, builder.func);
+        builder.ins().call(
+            trace_run_started_ref,
+            &[
+                entry_name_val,
+                trace_payload.type_tags,
+                trace_payload.count,
+                trace_payload.values_ptr,
+            ],
+        );
+        emit_release(&mut builder, module, runtime, trace_payload.type_tags);
+        emit_release(&mut builder, module, runtime, entry_name_val);
+
         let inner_ref = module.declare_func_in_func(inner_func_id, builder.func);
         let call = builder.ins().call(inner_ref, &call_args);
         let results: Vec<ClValue> = builder.inst_results(call).iter().copied().collect();
@@ -129,6 +158,9 @@ pub(super) fn define_extern_c_wrapper(
                         agent.span,
                     )
                 })?;
+                let trace_run_completed_ref =
+                    module.declare_func_in_func(runtime.trace_run_completed_string, builder.func);
+                builder.ins().call(trace_run_completed_ref, &[result]);
                 let into_cstr_ref =
                     module.declare_func_in_func(runtime.string_into_cstr, builder.func);
                 let converted = builder.ins().call(into_cstr_ref, &[result]);
@@ -136,6 +168,8 @@ pub(super) fn define_extern_c_wrapper(
                 builder.ins().return_(&[converted_value]);
             }
             Type::Grounded(inner) if matches!(&**inner, Type::String) => {
+                let trace_run_completed_ref =
+                    module.declare_func_in_func(runtime.trace_run_completed_string, builder.func);
                 let result = *results.first().ok_or_else(|| {
                     CodegenError::cranelift(
                         format!(
@@ -146,6 +180,7 @@ pub(super) fn define_extern_c_wrapper(
                         agent.span,
                     )
                 })?;
+                builder.ins().call(trace_run_completed_ref, &[result]);
                 let capture_ref = module.declare_func_in_func(
                     runtime.grounded_capture_string_handle,
                     builder.func,
@@ -170,6 +205,21 @@ pub(super) fn define_extern_c_wrapper(
                         agent.span,
                     )
                 })?;
+                let trace_result_ref = match &agent.return_ty {
+                    Type::Grounded(inner) => match &**inner {
+                        Type::Int => Some(runtime.trace_run_completed_int),
+                        Type::Bool => Some(runtime.trace_run_completed_bool),
+                        Type::Float => Some(runtime.trace_run_completed_float),
+                        Type::String => Some(runtime.trace_run_completed_string),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(trace_result) = trace_result_ref {
+                    let trace_run_completed_ref =
+                        module.declare_func_in_func(trace_result, builder.func);
+                    builder.ins().call(trace_run_completed_ref, &[result]);
+                }
                 let capture_ref = module.declare_func_in_func(
                     runtime.grounded_capture_scalar_handle,
                     builder.func,
@@ -180,6 +230,13 @@ pub(super) fn define_extern_c_wrapper(
                 builder.ins().return_(&[result]);
             }
             _ => {
+                let trace_result_ref = match &agent.return_ty {
+                    Type::Int => Some(runtime.trace_run_completed_int),
+                    Type::Bool => Some(runtime.trace_run_completed_bool),
+                    Type::Float => Some(runtime.trace_run_completed_float),
+                    Type::String => Some(runtime.trace_run_completed_string),
+                    _ => None,
+                };
                 let result = *results.first().ok_or_else(|| {
                     CodegenError::cranelift(
                         format!(
@@ -190,6 +247,11 @@ pub(super) fn define_extern_c_wrapper(
                         agent.span,
                     )
                 })?;
+                if let Some(trace_result) = trace_result_ref {
+                    let trace_run_completed_ref =
+                        module.declare_func_in_func(trace_result, builder.func);
+                    builder.ins().call(trace_run_completed_ref, &[result]);
+                }
                 builder.ins().return_(&[result]);
             }
         }

@@ -32,6 +32,18 @@ agent maybe_dangerous(flag: Bool, value: String) -> String:
     return "skipped"
 "#;
 
+const GROUNDED_SRC: &str = r#"
+effect retrieval:
+    data: grounded
+
+tool grounded_echo(value: String) -> Grounded<String> uses retrieval
+
+@budget($0.01)
+pub extern "c"
+agent grounded_tag(tag: String) -> Grounded<String>:
+    return grounded_echo(tag)
+"#;
+
 struct BuiltLibrary {
     _temp: TempDir,
     path: PathBuf,
@@ -67,6 +79,15 @@ fn build_approval_library() -> BuiltLibrary {
     build_library_from_source(
         APPROVAL_SRC,
         "tests/trace_record/approval.cor",
+        &[tools_lib.as_path()],
+    )
+}
+
+fn build_grounded_library() -> BuiltLibrary {
+    let tools_lib = test_tools_lib_path();
+    build_library_from_source(
+        GROUNDED_SRC,
+        "tests/trace_record/grounded.cor",
         &[tools_lib.as_path()],
     )
 }
@@ -283,6 +304,155 @@ fn prompt_call_agent_replays_recorded_trace_on_windows() {
         );
         assert_ne!(replay_observation, 0);
         free_result(replay_result);
+
+        std::mem::forget(lib);
+    }
+}
+
+#[test]
+fn direct_grounded_export_records_run_events() {
+    let built = build_grounded_library();
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let trace_path = trace_dir.path().join("grounded.jsonl");
+
+    unsafe {
+        std::env::set_var("CORVID_TRACE_PATH", &trace_path);
+        std::env::remove_var("CORVID_TRACE_DISABLE");
+        std::env::remove_var("CORVID_REPLAY_TRACE_PATH");
+
+        let lib = Library::new(&built.path).expect("load library");
+        let grounded_tag: libloading::Symbol<
+            unsafe extern "C" fn(*const c_char, *mut u64, *mut u64) -> *const c_char,
+        > = lib.get(b"grounded_tag").expect("resolve grounded_tag");
+        let grounded_sources: libloading::Symbol<
+            unsafe extern "C" fn(u64, *mut *const c_char, usize) -> i32,
+        > = lib
+            .get(b"corvid_grounded_sources")
+            .expect("resolve corvid_grounded_sources");
+        let grounded_release: libloading::Symbol<unsafe extern "C" fn(u64)> = lib
+            .get(b"corvid_grounded_release")
+            .expect("resolve corvid_grounded_release");
+        let observation_release: libloading::Symbol<unsafe extern "C" fn(u64)> = lib
+            .get(b"corvid_observation_release")
+            .expect("resolve corvid_observation_release");
+        let free_string: libloading::Symbol<unsafe extern "C" fn(*const c_char)> = lib
+            .get(b"corvid_free_string")
+            .expect("resolve corvid_free_string");
+
+        let arg = CString::new("catalog-proof").unwrap();
+        let mut grounded_handle = 0u64;
+        let mut observation_handle = 0u64;
+        let value = grounded_tag(
+            arg.as_ptr(),
+            &mut grounded_handle,
+            &mut observation_handle,
+        );
+        assert!(!value.is_null(), "grounded call returned null");
+        assert_ne!(grounded_handle, 0);
+        assert_ne!(observation_handle, 0);
+        assert_eq!(CStr::from_ptr(value).to_str().unwrap(), "catalog-proof");
+
+        let mut sources = vec![std::ptr::null(); 4];
+        let source_count = grounded_sources(grounded_handle, sources.as_mut_ptr(), sources.len());
+        assert_eq!(source_count, 1);
+        assert_eq!(CStr::from_ptr(sources[0]).to_str().unwrap(), "grounded_echo");
+
+        observation_release(observation_handle);
+        grounded_release(grounded_handle);
+        free_string(value);
+
+        let events = read_events_from_path(&trace_path).expect("read trace");
+        validate_supported_schema(&events).expect("validate trace schema");
+        assert!(
+            matches!(events.first(), Some(TraceEvent::SchemaHeader { .. })),
+            "trace should start with SchemaHeader, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TraceEvent::RunStarted { .. })),
+            "trace should contain RunStarted, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TraceEvent::RunCompleted { .. })),
+            "trace should contain RunCompleted, got {events:?}"
+        );
+
+        std::mem::forget(lib);
+    }
+}
+
+#[test]
+fn direct_grounded_export_replays_recorded_trace() {
+    let built = build_grounded_library();
+    let trace_dir = tempfile::tempdir().expect("trace tempdir");
+    let record_path = trace_dir.path().join("grounded.jsonl");
+
+    unsafe {
+        std::env::set_var("CORVID_TRACE_PATH", &record_path);
+        std::env::remove_var("CORVID_TRACE_DISABLE");
+        std::env::remove_var("CORVID_REPLAY_TRACE_PATH");
+
+        let lib = Library::new(&built.path).expect("load library");
+        let grounded_tag: libloading::Symbol<
+            unsafe extern "C" fn(*const c_char, *mut u64, *mut u64) -> *const c_char,
+        > = lib.get(b"grounded_tag").expect("resolve grounded_tag");
+        let grounded_sources: libloading::Symbol<
+            unsafe extern "C" fn(u64, *mut *const c_char, usize) -> i32,
+        > = lib
+            .get(b"corvid_grounded_sources")
+            .expect("resolve corvid_grounded_sources");
+        let grounded_release: libloading::Symbol<unsafe extern "C" fn(u64)> = lib
+            .get(b"corvid_grounded_release")
+            .expect("resolve corvid_grounded_release");
+        let observation_release: libloading::Symbol<unsafe extern "C" fn(u64)> = lib
+            .get(b"corvid_observation_release")
+            .expect("resolve corvid_observation_release");
+        let free_string: libloading::Symbol<unsafe extern "C" fn(*const c_char)> = lib
+            .get(b"corvid_free_string")
+            .expect("resolve corvid_free_string");
+
+        let arg = CString::new("catalog-proof").unwrap();
+        let mut grounded_handle = 0u64;
+        let mut observation_handle = 0u64;
+        let value = grounded_tag(
+            arg.as_ptr(),
+            &mut grounded_handle,
+            &mut observation_handle,
+        );
+        assert_eq!(CStr::from_ptr(value).to_str().unwrap(), "catalog-proof");
+        observation_release(observation_handle);
+        grounded_release(grounded_handle);
+        free_string(value);
+
+        std::env::set_var("CORVID_REPLAY_TRACE_PATH", &record_path);
+        std::env::set_var("CORVID_TRACE_DISABLE", "1");
+
+        let mut replay_grounded_handle = 0u64;
+        let mut replay_observation_handle = 0u64;
+        let replay_value = grounded_tag(
+            arg.as_ptr(),
+            &mut replay_grounded_handle,
+            &mut replay_observation_handle,
+        );
+        assert_eq!(CStr::from_ptr(replay_value).to_str().unwrap(), "catalog-proof");
+        assert_ne!(replay_grounded_handle, 0);
+        assert_ne!(replay_observation_handle, 0);
+
+        let mut replay_sources = vec![std::ptr::null(); 4];
+        let replay_source_count = grounded_sources(
+            replay_grounded_handle,
+            replay_sources.as_mut_ptr(),
+            replay_sources.len(),
+        );
+        assert_eq!(replay_source_count, 1);
+        assert_eq!(CStr::from_ptr(replay_sources[0]).to_str().unwrap(), "grounded_echo");
+
+        observation_release(replay_observation_handle);
+        grounded_release(replay_grounded_handle);
+        free_string(replay_value);
 
         std::mem::forget(lib);
     }
